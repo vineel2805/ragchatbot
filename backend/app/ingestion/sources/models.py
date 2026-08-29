@@ -10,7 +10,7 @@ class DiscoveryMode(StrEnum):
 
 
 class ExtractionConfig(BaseModel):
-    """Selector packs used later for HTML extraction. Unused until parsing exists."""
+    """Selector packs for HTML extraction."""
 
     content_selectors: list[str]
     strip_selectors: list[str]
