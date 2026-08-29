@@ -5,7 +5,7 @@ import unittest
 
 from app.ingestion.chunker import OVERLAP_TOKENS, TARGET_TOKENS, chunk_document
 from app.ingestion.extract import extract_document
-from app.ingestion.ids import CHUNKER_VERSION, make_chunk_id, make_document_id
+from app.ingestion.ids import CHUNKER_VERSION, make_chunk_id, make_document_id, make_point_id
 from app.ingestion.normalize import normalize_extracted_text
 from app.ingestion.registry import get_source, iter_sources, list_source_ids
 from app.ingestion.tokenize import count_tokens, overlap_text
@@ -184,6 +184,14 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(chunks[1].chunk_id, make_chunk_id("fastapi", extracted.canonical_url, 1))
         again = chunk_document(get_source("fastapi"), extracted)
         self.assertEqual([c.chunk_id for c in chunks], [c.chunk_id for c in again])
+        point = make_point_id(expected)
+        self.assertEqual(point, make_point_id(expected))
+        self.assertEqual(make_point_id(chunks[0].chunk_id), make_point_id(chunks[0].chunk_id))
+        from uuid import UUID
+
+        parsed = UUID(point)
+        self.assertEqual(parsed.version, 8)
+        self.assertIn("RFC 4122", str(parsed.variant))
 
 
 class ChunkingTests(unittest.TestCase):
