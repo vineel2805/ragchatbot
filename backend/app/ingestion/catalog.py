@@ -19,7 +19,7 @@ from app.ingestion.registry import get_source
 from app.ingestion.sanitize import sanitize_error_message
 from app.ingestion.url_security import CanonicalizationError, canonicalize_url
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SOFT_DELETE_THRESHOLD = 2
 DEFAULT_CATALOG_PATH = Path("data/catalog/url_catalog.sqlite")
 
@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS catalog_urls (
     content_sha256 TEXT,
     extracted_sha256 TEXT,
     chunker_version TEXT,
+    indexed_sha256 TEXT,
+    indexed_chunker_version TEXT,
     error_type TEXT,
     error_message TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -377,6 +379,61 @@ class IngestionCatalog:
             and record.chunker_version == chunker_version
         )
 
+    def needs_indexing(
+        self,
+        source_id: str,
+        url: str,
+        *,
+        extracted_sha256: str,
+        chunker_version: str,
+    ) -> bool:
+        """Return True when the URL's Qdrant representation is stale or absent.
+
+        A URL needs (re-)indexing when:
+        - it has never been indexed (indexed_sha256 is NULL), OR
+        - the extracted content has changed (new extracted_sha256), OR
+        - the chunker version has changed (new chunker_version).
+        """
+        record = self.get_url(source_id, url)
+        if record is None:
+            return True
+        if not record.indexed_sha256 or not record.indexed_chunker_version:
+            return True
+        return not (
+            record.indexed_sha256 == extracted_sha256
+            and record.indexed_chunker_version == chunker_version
+        )
+
+    def record_indexing(
+        self,
+        source_id: str,
+        url: str,
+        *,
+        extracted_sha256: str,
+        chunker_version: str,
+        run_id: str | None = None,
+    ) -> UrlRecord:
+        """Record that this URL's chunks have been successfully upserted to Qdrant."""
+        canonical = _canonical_for_source(source_id, url)
+        now = self._stamp()
+
+        def write() -> UrlRecord:
+            self._require_url(source_id, canonical)
+            self._conn.execute(
+                """
+                UPDATE catalog_urls
+                SET indexed_sha256 = ?,
+                    indexed_chunker_version = ?,
+                    last_touched_run_id = ?,
+                    updated_at = ?
+                WHERE source_id = ? AND canonical_url = ?
+                """,
+                (extracted_sha256, chunker_version, run_id, now, source_id, canonical),
+            )
+            return self._get_url(source_id, canonical)
+
+        return self._write(write)
+
     def record_extraction(
         self,
         source_id: str,
@@ -508,11 +565,35 @@ class IngestionCatalog:
 
         return self._write(write)
 
+    def list_document_ids(self, source_id: str) -> list[str]:
+        """Return all distinct document_ids for *source_id* (including out-of-corpus entries)."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT document_id FROM catalog_urls WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+        return [row["document_id"] for row in rows]
+
     def _initialize(self) -> None:
         self._conn.executescript(_SCHEMA)
         row = self._conn.execute("SELECT version FROM schema_meta").fetchone()
         if row is None:
             self._conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
+        elif row["version"] < SCHEMA_VERSION:
+            self._migrate(row["version"])
+
+    def _migrate(self, from_version: int) -> None:
+        """Idempotent forward migration from *from_version* to SCHEMA_VERSION."""
+        if from_version < 2:
+            # Add Qdrant indexing state columns (v1 → v2).
+            for stmt in (
+                "ALTER TABLE catalog_urls ADD COLUMN indexed_sha256 TEXT",
+                "ALTER TABLE catalog_urls ADD COLUMN indexed_chunker_version TEXT",
+            ):
+                try:
+                    self._conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # Column already exists — migration is idempotent.
+            self._conn.execute("UPDATE schema_meta SET version = 2")
 
     def _stamp(self) -> str:
         value = self._now()
@@ -587,6 +668,8 @@ def _url_from_row(row: sqlite3.Row) -> UrlRecord:
         content_sha256=row["content_sha256"],
         extracted_sha256=row["extracted_sha256"],
         chunker_version=row["chunker_version"],
+        indexed_sha256=row["indexed_sha256"],
+        indexed_chunker_version=row["indexed_chunker_version"],
         error_type=row["error_type"],
         error_message=row["error_message"],
         attempt_count=row["attempt_count"],

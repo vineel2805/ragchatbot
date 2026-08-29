@@ -33,6 +33,8 @@ class SourceIngestResult:
     urls_fetched: int = 0
     url_failures: int = 0
     sitemaps_failed: int = 0
+    chunks_indexed: int = 0
+    points_deactivated: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -46,6 +48,7 @@ def ingest_source(
     monotonic: Callable[[], float] | None = None,
     rate_limiter: RateLimiter | None = None,
     user_agent: str | None = None,
+    indexer=None,  # QdrantIndexer | None — avoid circular import
 ) -> SourceIngestResult:
     """Bounded discovery + fetch/extract/chunk for one allowlisted source."""
     sleeper = sleep or time.sleep
@@ -66,6 +69,9 @@ def ingest_source(
     fetched: set[str] = set()
     queue: deque[str] = deque()
     seen_registered: set[str] = set()
+
+    if indexer is not None:
+        indexer.ensure_collection()
 
     def enqueue(raw_url: str, discovered_from: str | None) -> None:
         check = validate_url(source, raw_url)
@@ -117,10 +123,15 @@ def ingest_source(
                 url,
                 enqueue,
                 result,
+                indexer=indexer,
             )
 
         catalog.record_missing_for_unseen(source.source_id, run.id)
-        catalog.apply_soft_deletes(source.source_id, threshold=SOFT_DELETE_THRESHOLD)
+        deleted = catalog.apply_soft_deletes(source.source_id, threshold=SOFT_DELETE_THRESHOLD)
+        if indexer is not None:
+            for rec in deleted:
+                n = indexer.deactivate_document(rec.document_id)
+                result.points_deactivated += n
         result.run = catalog.finish_run(run.id, succeeded=True)
     except Exception as exc:
         result.errors.append(type(exc).__name__)
@@ -202,6 +213,7 @@ def _process_document(
     url: str,
     enqueue,
     result: SourceIngestResult,
+    indexer=None,
 ) -> None:
     try:
         limiter.wait()
@@ -227,28 +239,38 @@ def _process_document(
             )
             result.url_failures += 1
             return
-        if catalog.needs_processing(
+        needs_chunk = catalog.needs_processing(
             source.source_id,
             url,
             extracted_sha256=extracted.extracted_sha256,
             chunker_version=CHUNKER_VERSION,
-        ):
-            chunk_document(source, extracted)
-            catalog.record_extraction(
-                source.source_id,
-                url,
-                extracted_sha256=extracted.extracted_sha256,
-                chunker_version=CHUNKER_VERSION,
-                run_id=run_id,
-            )
-        else:
-            catalog.record_extraction(
-                source.source_id,
-                url,
-                extracted_sha256=extracted.extracted_sha256,
-                chunker_version=CHUNKER_VERSION,
-                run_id=run_id,
-            )
+        )
+        needs_index = indexer is not None and catalog.needs_indexing(
+            source.source_id,
+            url,
+            extracted_sha256=extracted.extracted_sha256,
+            chunker_version=CHUNKER_VERSION,
+        )
+        chunks = chunk_document(source, extracted) if (needs_chunk or needs_index) else []
+        catalog.record_extraction(
+            source.source_id,
+            url,
+            extracted_sha256=extracted.extracted_sha256,
+            chunker_version=CHUNKER_VERSION,
+            run_id=run_id,
+        )
+        if indexer is not None and chunks:
+            try:
+                ix = indexer.index_document(source.source_id, url, chunks, run_id)
+                result.chunks_indexed += ix.chunks_upserted
+                result.points_deactivated += ix.points_deactivated
+                if not ix.ok:
+                    result.url_failures += 1
+            except Exception as exc:
+                logger.error(
+                    "Indexing failed for %s/%s: %s", source.source_id, url, exc
+                )
+                result.url_failures += 1
     except Exception as exc:
         result.url_failures += 1
         try:

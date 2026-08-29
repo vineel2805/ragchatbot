@@ -58,6 +58,9 @@ class UrlRecord:
     duplicate_of: str | None
     created_at: str
     updated_at: str
+    # Qdrant indexing state — populated by record_indexing(); None until first index.
+    indexed_sha256: str | None = None
+    indexed_chunker_version: str | None = None
 
 
 class CatalogError(ValueError):

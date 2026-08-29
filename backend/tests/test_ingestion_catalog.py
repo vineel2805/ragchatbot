@@ -34,7 +34,7 @@ class CatalogTests(unittest.TestCase):
     def test_database_initialization(self) -> None:
         self.assertTrue(self.path.exists())
         row = self.catalog._conn.execute("SELECT version FROM schema_meta").fetchone()
-        self.assertEqual(row["version"], 1)
+        self.assertEqual(row["version"], 2)
 
     def test_schema_creation(self) -> None:
         names = {
@@ -55,6 +55,8 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("last_modified", columns)
         self.assertIn("extracted_sha256", columns)
         self.assertIn("chunker_version", columns)
+        self.assertIn("indexed_sha256", columns)
+        self.assertIn("indexed_chunker_version", columns)
 
     def test_unique_source_and_canonical_url(self) -> None:
         self.catalog.register_url("fastapi", FASTAPI_URL)
@@ -306,6 +308,223 @@ class CatalogTests(unittest.TestCase):
         unseen = self.catalog.record_missing_for_unseen("fastapi", "run-other")
         self.assertEqual(unseen[0].consecutive_missing_success_runs, 1)
         self.assertTrue(unseen[0].is_in_corpus)
+
+
+class IndexingCatalogTests(unittest.TestCase):
+    """Tests for needs_indexing, record_indexing, list_document_ids, and v1->v2 migration."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "url_catalog.sqlite"
+        self.ids = iter([f"run-{i}" for i in range(1, 50)])
+        self.catalog = IngestionCatalog(
+            self.path,
+            now=lambda: STAMP,
+            new_id=lambda: next(self.ids),
+        )
+        run = self.catalog.create_run("fastapi")
+        self.run_id = run.id
+        self.catalog.register_url("fastapi", FASTAPI_URL, run_id=self.run_id)
+        self.catalog.mark_fetch_started("fastapi", FASTAPI_URL, run_id=self.run_id)
+        self.catalog.mark_fetch_succeeded("fastapi", FASTAPI_URL, run_id=self.run_id, http_status=200)
+        self.catalog.record_extraction(
+            "fastapi", FASTAPI_URL,
+            extracted_sha256="sha-abc",
+            chunker_version=CHUNKER_VERSION,
+            run_id=self.run_id,
+        )
+
+    def tearDown(self) -> None:
+        self.catalog.close()
+        self._tmp.cleanup()
+
+    # --- needs_indexing --------------------------------------------------
+
+    def test_needs_indexing_true_initially(self) -> None:
+        self.assertTrue(
+            self.catalog.needs_indexing(
+                "fastapi", FASTAPI_URL,
+                extracted_sha256="sha-abc",
+                chunker_version=CHUNKER_VERSION,
+            )
+        )
+
+    def test_needs_indexing_false_after_record_indexing(self) -> None:
+        self.catalog.record_indexing(
+            "fastapi", FASTAPI_URL,
+            extracted_sha256="sha-abc",
+            chunker_version=CHUNKER_VERSION,
+            run_id=self.run_id,
+        )
+        self.assertFalse(
+            self.catalog.needs_indexing(
+                "fastapi", FASTAPI_URL,
+                extracted_sha256="sha-abc",
+                chunker_version=CHUNKER_VERSION,
+            )
+        )
+
+    def test_needs_indexing_true_after_sha256_change(self) -> None:
+        self.catalog.record_indexing(
+            "fastapi", FASTAPI_URL,
+            extracted_sha256="sha-abc",
+            chunker_version=CHUNKER_VERSION,
+            run_id=self.run_id,
+        )
+        # New content sha256.
+        self.assertTrue(
+            self.catalog.needs_indexing(
+                "fastapi", FASTAPI_URL,
+                extracted_sha256="sha-xyz",
+                chunker_version=CHUNKER_VERSION,
+            )
+        )
+
+    def test_needs_indexing_true_after_chunker_version_change(self) -> None:
+        self.catalog.record_indexing(
+            "fastapi", FASTAPI_URL,
+            extracted_sha256="sha-abc",
+            chunker_version="heading-v1",
+            run_id=self.run_id,
+        )
+        # New chunker version.
+        self.assertTrue(
+            self.catalog.needs_indexing(
+                "fastapi", FASTAPI_URL,
+                extracted_sha256="sha-abc",
+                chunker_version="heading-v2",
+            )
+        )
+
+    # --- record_indexing -------------------------------------------------
+
+    def test_record_indexing_persists_fields(self) -> None:
+        self.catalog.record_indexing(
+            "fastapi", FASTAPI_URL,
+            extracted_sha256="sha-abc",
+            chunker_version=CHUNKER_VERSION,
+            run_id=self.run_id,
+        )
+        rec = self.catalog.get_url("fastapi", FASTAPI_URL)
+        self.assertEqual(rec.indexed_sha256, "sha-abc")
+        self.assertEqual(rec.indexed_chunker_version, CHUNKER_VERSION)
+
+    def test_record_indexing_updates_existing_values(self) -> None:
+        self.catalog.record_indexing(
+            "fastapi", FASTAPI_URL,
+            extracted_sha256="sha-v1",
+            chunker_version="heading-v1",
+            run_id=self.run_id,
+        )
+        self.catalog.record_indexing(
+            "fastapi", FASTAPI_URL,
+            extracted_sha256="sha-v2",
+            chunker_version="heading-v2",
+            run_id=self.run_id,
+        )
+        rec = self.catalog.get_url("fastapi", FASTAPI_URL)
+        self.assertEqual(rec.indexed_sha256, "sha-v2")
+        self.assertEqual(rec.indexed_chunker_version, "heading-v2")
+
+    # --- list_document_ids -----------------------------------------------
+
+    def test_list_document_ids_returns_registered_ids(self) -> None:
+        doc_id = make_document_id("fastapi", FASTAPI_CANONICAL)
+        ids = self.catalog.list_document_ids("fastapi")
+        self.assertIn(doc_id, ids)
+
+    def test_list_document_ids_empty_for_unknown_source(self) -> None:
+        ids = self.catalog.list_document_ids("unknown-source")
+        self.assertEqual(ids, [])
+
+    def test_list_document_ids_does_not_include_other_source(self) -> None:
+        run2 = self.catalog.create_run("python")
+        self.catalog.register_url("python", PYTHON_URL, run_id=run2.id)
+        fastapi_ids = self.catalog.list_document_ids("fastapi")
+        python_ids = self.catalog.list_document_ids("python")
+        # Use the catalog's canonical form rather than computing from raw PYTHON_URL.
+        python_rec = self.catalog.get_url("python", PYTHON_URL)
+        python_doc_id = python_rec.document_id
+        self.assertNotIn(python_doc_id, fastapi_ids)
+        self.assertIn(python_doc_id, python_ids)
+
+    # --- v1 -> v2 migration ----------------------------------------------
+
+    def test_migration_from_v1_adds_indexing_columns(self) -> None:
+        """Create a v1 schema DB manually, then open it via IngestionCatalog and verify migration."""
+        import sqlite3 as _sqlite3
+
+        v1_path = Path(self._tmp.name) / "v1_catalog.sqlite"
+        # Build a minimal v1 schema without the new columns.
+        conn = _sqlite3.connect(str(v1_path))
+        conn.execute(
+            """
+            CREATE TABLE schema_meta (version INTEGER NOT NULL);
+            """
+        )
+        conn.execute("INSERT INTO schema_meta (version) VALUES (1)")
+        conn.execute(
+            """
+            CREATE TABLE catalog_urls (
+                source_id TEXT NOT NULL,
+                canonical_url TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                discovered_from TEXT,
+                fetch_status TEXT NOT NULL DEFAULT 'pending',
+                http_status INTEGER,
+                etag TEXT,
+                last_modified TEXT,
+                content_type TEXT,
+                size_bytes INTEGER,
+                content_sha256 TEXT,
+                extracted_sha256 TEXT,
+                chunker_version TEXT,
+                error_type TEXT,
+                error_message TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                fetched_at TEXT,
+                last_success_at TEXT,
+                last_seen_run_id TEXT,
+                last_touched_run_id TEXT,
+                consecutive_missing_success_runs INTEGER NOT NULL DEFAULT 0,
+                is_in_corpus INTEGER NOT NULL DEFAULT 1,
+                duplicate_of TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (source_id, canonical_url)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ingestion_runs (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                error_type TEXT,
+                error_message TEXT
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with IngestionCatalog — migration should run automatically.
+        cat = IngestionCatalog(v1_path)
+        try:
+            # Version should now be 2.
+            row = cat._conn.execute("SELECT version FROM schema_meta").fetchone()
+            self.assertEqual(row["version"], 2)
+            # New columns must exist.
+            cols = {
+                r[1] for r in cat._conn.execute("PRAGMA table_info(catalog_urls)")
+            }
+            self.assertIn("indexed_sha256", cols)
+            self.assertIn("indexed_chunker_version", cols)
+        finally:
+            cat.close()
 
 
 if __name__ == "__main__":
