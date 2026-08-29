@@ -25,6 +25,8 @@ frontend/dist/
 
 # Local databases / vector storage
 qdrant_storage/
+data/catalog/
+data/raw/
 
 # IDE
 .vscode/

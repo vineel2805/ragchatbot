@@ -14,6 +14,7 @@ DEFAULT_POOL_TIMEOUT = 5.0
 
 HTML_ACCEPT = "text/html,application/xhtml+xml;q=0.9"
 ROBOTS_ACCEPT = "text/plain,*/*;q=0.1"
+XML_ACCEPT = "application/xml,text/xml,application/xhtml+xml;q=0.8,*/*;q=0.1"
 
 
 def default_timeout() -> httpx.Timeout:

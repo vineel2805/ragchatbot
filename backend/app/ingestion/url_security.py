@@ -99,6 +99,46 @@ def validate_url(source: SourceDefinition, url: str) -> UrlValidationResult:
     return UrlValidationResult(True, REASON_OK, canonical)
 
 
+def validate_sitemap_url(
+    source: SourceDefinition,
+    url: str,
+    *,
+    allow_child: bool = False,
+) -> UrlValidationResult:
+    """Allow registered sitemap URLs (and same-host .xml children of a sitemap index)."""
+    raw = url.strip()
+    if not raw:
+        return UrlValidationResult(False, REASON_MALFORMED)
+    parsed = urlparse(raw)
+    if not parsed.scheme:
+        return UrlValidationResult(False, REASON_MALFORMED)
+    if parsed.scheme.lower() != "https":
+        if parsed.scheme.lower() == "http":
+            return UrlValidationResult(False, REASON_HTTPS_REQUIRED)
+        return UrlValidationResult(False, REASON_UNSUPPORTED_SCHEME)
+    if parsed.username is not None or parsed.password is not None:
+        return UrlValidationResult(False, REASON_CREDENTIALS)
+    try:
+        canonical = canonicalize_url(raw, keep_query_strings=source.keep_query_strings)
+    except CanonicalizationError:
+        return UrlValidationResult(False, REASON_MALFORMED)
+    host = urlparse(canonical).hostname
+    if host is None or host not in source.allowed_hosts:
+        return UrlValidationResult(False, REASON_INVALID_HOST, canonical)
+    listed: set[str] = set()
+    for sitemap in source.sitemap_urls:
+        try:
+            listed.add(canonicalize_url(sitemap, keep_query_strings=source.keep_query_strings))
+        except CanonicalizationError:
+            continue
+    if canonical in listed:
+        return UrlValidationResult(True, REASON_OK, canonical)
+    path = urlparse(canonical).path or "/"
+    if allow_child and (path.endswith(".xml") or "sitemap" in path.lower()):
+        return UrlValidationResult(True, REASON_OK, canonical)
+    return UrlValidationResult(False, REASON_INVALID_PATH, canonical)
+
+
 def validate_redirect(
     source: SourceDefinition,
     from_url: str,

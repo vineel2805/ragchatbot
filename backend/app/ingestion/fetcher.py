@@ -3,17 +3,18 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from urllib.parse import urljoin
 
 import httpx
 
 from app.core.config import get_settings
 from app.ingestion.fetch_models import FetchResult, FetchStatus, HttpExchange
-from app.ingestion.http_client import HTML_ACCEPT, HttpClient, default_timeout
+from app.ingestion.http_client import HTML_ACCEPT, XML_ACCEPT, HttpClient, default_timeout
 from app.ingestion.retry import MAX_ATTEMPTS, get_with_retries
 from app.ingestion.robots import RobotsChecker
 from app.ingestion.sanitize import safe_log_fields, sanitize_error_message
 from app.ingestion.sources.models import SourceDefinition
-from app.ingestion.url_security import validate_redirect, validate_url
+from app.ingestion.url_security import validate_redirect, validate_sitemap_url, validate_url
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,15 @@ MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
 MAX_REDIRECTS = 5
 _REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
 _HTML_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+_XML_TYPES = frozenset(
+    {
+        "application/xml",
+        "text/xml",
+        "application/atom+xml",
+        "application/rss+xml",
+        "text/plain",
+    }
+)
 
 
 def build_user_agent(source: SourceDefinition) -> str:
@@ -137,6 +147,166 @@ class DocumentationFetcher:
                 return failed
             current = redirected.canonical_url
 
+        failed = FetchResult(
+            ok=False,
+            status=FetchStatus.FAILED,
+            reason="too_many_redirects",
+            requested_url=url,
+            canonical_url=validation.canonical_url,
+            attempts=total_attempts,
+            error_type="too_many_redirects",
+        )
+        self._log(failed)
+        return failed
+
+    def fetch_sitemap(self, url: str, *, allow_child: bool = False) -> FetchResult:
+        """Fetch a sitemap over the same HTTP client, robots, and redirect rules.
+
+        Sitemap paths are not documentation pages; they are validated with
+        validate_sitemap_url instead of the docs allowlist.
+        """
+        validation = validate_sitemap_url(self.source, url, allow_child=allow_child)
+        if not validation.allowed or validation.canonical_url is None:
+            result = FetchResult(
+                ok=False,
+                status=FetchStatus.REJECTED,
+                reason=validation.reason,
+                requested_url=url,
+                canonical_url=validation.canonical_url,
+                error_type=validation.reason,
+            )
+            self._log(result)
+            return result
+
+        current = validation.canonical_url
+        total_attempts = 0
+        for _hop in range(MAX_REDIRECTS + 1):
+            blocked = self._robots.allowed(current, url)
+            if blocked is not None:
+                self._log(blocked)
+                return blocked
+            exchange, attempts = get_with_retries(
+                self._client,
+                current,
+                max_bytes=self._max_bytes,
+                accept=XML_ACCEPT,
+                sleep=self._sleep,
+                max_attempts=self._max_attempts,
+            )
+            total_attempts += attempts
+            if exchange.size_exceeded:
+                result = FetchResult(
+                    ok=False,
+                    status=FetchStatus.SKIPPED,
+                    reason="size_exceeded",
+                    requested_url=url,
+                    canonical_url=validation.canonical_url,
+                    final_url=current,
+                    http_status=exchange.status_code,
+                    attempts=total_attempts,
+                    error_type="size_exceeded",
+                )
+                self._log(result)
+                return result
+            if not exchange.completed:
+                result = FetchResult(
+                    ok=False,
+                    status=FetchStatus.FAILED,
+                    reason="retry_exhausted",
+                    requested_url=url,
+                    canonical_url=validation.canonical_url,
+                    final_url=current,
+                    attempts=total_attempts,
+                    error_type=exchange.error_type or "failed",
+                    error_message=exchange.error_message,
+                )
+                self._log(result)
+                return result
+            status = exchange.status_code or 0
+            if status in _REDIRECT_STATUS:
+                location = exchange.headers.get("location", "")
+                resolved = urljoin(current, location)
+                redirected = validate_sitemap_url(
+                    self.source, resolved, allow_child=True
+                )
+                if not redirected.allowed or redirected.canonical_url is None:
+                    failed = FetchResult(
+                        ok=False,
+                        status=FetchStatus.REJECTED,
+                        reason="rejected_redirect",
+                        requested_url=url,
+                        canonical_url=validation.canonical_url,
+                        http_status=status,
+                        attempts=total_attempts,
+                        error_type=redirected.reason or "rejected_redirect",
+                    )
+                    self._log(failed)
+                    return failed
+                current = redirected.canonical_url
+                continue
+            if status in {404, 410}:
+                result = FetchResult(
+                    ok=False,
+                    status=FetchStatus.GONE,
+                    reason="http_404" if status == 404 else "http_410",
+                    requested_url=url,
+                    canonical_url=validation.canonical_url,
+                    final_url=current,
+                    http_status=status,
+                    attempts=total_attempts,
+                    error_type="gone",
+                )
+                self._log(result)
+                return result
+            if status >= 400:
+                result = FetchResult(
+                    ok=False,
+                    status=FetchStatus.FAILED,
+                    reason=f"http_{status}",
+                    requested_url=url,
+                    canonical_url=validation.canonical_url,
+                    final_url=current,
+                    http_status=status,
+                    attempts=total_attempts,
+                    error_type="http_error",
+                )
+                self._log(result)
+                return result
+            body = exchange.content or b""
+            media = _media_type(exchange.headers.get("content-type"))
+            looks_xml = body.lstrip().startswith((b"<?xml", b"<urlset", b"<sitemapindex", b"<Urlset"))
+            if media not in _XML_TYPES and media not in _HTML_TYPES and not looks_xml:
+                result = FetchResult(
+                    ok=False,
+                    status=FetchStatus.SKIPPED,
+                    reason="non_xml",
+                    requested_url=url,
+                    canonical_url=validation.canonical_url,
+                    final_url=current,
+                    http_status=status,
+                    content_type=exchange.headers.get("content-type"),
+                    attempts=total_attempts,
+                    error_type="non_xml",
+                )
+                self._log(result)
+                return result
+            result = FetchResult(
+                ok=True,
+                status=FetchStatus.FETCHED,
+                reason="ok",
+                requested_url=url,
+                canonical_url=validation.canonical_url,
+                final_url=current,
+                http_status=status,
+                content_type=exchange.headers.get("content-type"),
+                body=body,
+                etag=exchange.headers.get("etag"),
+                last_modified=exchange.headers.get("last-modified"),
+                size_bytes=len(body),
+                attempts=total_attempts,
+            )
+            self._log(result)
+            return result
         failed = FetchResult(
             ok=False,
             status=FetchStatus.FAILED,
