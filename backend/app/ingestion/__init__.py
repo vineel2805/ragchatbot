@@ -12,6 +12,7 @@ from app.ingestion.indexer import (
     PointData,
     QdrantClientAdapter,
     QdrantIndexer,
+    SearchHit,
     VectorStoreClient,
     make_qdrant_indexer,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "PointData",
     "QdrantClientAdapter",
     "QdrantIndexer",
+    "SearchHit",
     "RateLimiter",
     "RunStatus",
     "SOFT_DELETE_THRESHOLD",

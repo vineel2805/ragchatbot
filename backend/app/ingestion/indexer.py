@@ -30,6 +30,19 @@ class PointData:
     payload: dict[str, Any]
 
 
+@dataclass
+class SearchHit:
+    """One result from a vector similarity search.
+
+    ``point_id`` is the Qdrant point UUID string.  ``payload`` contains the
+    full point payload as stored (source_id, chunk_id, text, …).
+    """
+
+    score: float
+    point_id: str
+    payload: dict[str, Any]
+
+
 # ---------------------------------------------------------------------------
 # VectorStoreClient Protocol — injectable for tests
 # ---------------------------------------------------------------------------
@@ -56,6 +69,23 @@ class VectorStoreClient(Protocol):
     def set_is_active(
         self, collection_name: str, point_ids: list[str], is_active: bool
     ) -> None: ...
+
+    def search(
+        self,
+        collection_name: str,
+        query_vector: list[float],
+        top_k: int,
+        source_id: str | None,
+    ) -> list[SearchHit]:
+        """Vector similarity search.
+
+        Implementations MUST:
+        - Filter ``is_active = true`` unconditionally.
+        - Filter ``source_id`` when *source_id* is not ``None``.
+        - Never accept raw Qdrant filter objects from callers.
+        - Return at most *top_k* hits, sorted by score descending.
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +391,50 @@ class QdrantClientAdapter:
             payload={"is_active": is_active},
             points=PointIdsList(points=point_ids),
         )
+
+    def search(
+        self,
+        collection_name: str,
+        query_vector: list[float],
+        top_k: int,
+        source_id: str | None,
+    ) -> list[SearchHit]:
+        """Vector similarity search with mandatory is_active filter.
+
+        The ``is_active = true`` condition is always applied.  When *source_id*
+        is provided it is added as a second keyword-match condition.  No other
+        filters can be injected by callers.
+        """
+        from qdrant_client.models import (  # lazy
+            FieldCondition,
+            Filter,
+            MatchValue,
+        )
+
+        must = [
+            FieldCondition(key="is_active", match=MatchValue(value=True))
+        ]
+        if source_id is not None:
+            must.append(
+                FieldCondition(key="source_id", match=MatchValue(value=source_id))
+            )
+
+        results = self._client.search(
+            collection_name=collection_name,
+            query_vector=query_vector,
+            query_filter=Filter(must=must),
+            limit=top_k,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return [
+            SearchHit(
+                score=float(r.score),
+                point_id=str(r.id),
+                payload=dict(r.payload) if r.payload else {},
+            )
+            for r in results
+        ]
 
 
 # ---------------------------------------------------------------------------
