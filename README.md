@@ -78,7 +78,7 @@ This is the recommended way to run the complete application.
 1. Clone the repository:
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/vineel2805/ragchatbot.git
 cd devdocs-rag
 ```
 
