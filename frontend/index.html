@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <meta
+      name="description"
+      content="DevDocs — an AI assistant grounded in indexed developer documentation."
+    />
+
+    <title>DevDocs</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+
+    <link rel="stylesheet" href="styles.css" />
+    <script src="app.js?v=2" defer></script>
+  </head>
+
+  <body>
+    <!-- Top navigation -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-icon">D</div>
+        <span>DevDocs</span>
+      </div>
+
+      <button id="new-chat" class="new-chat" type="button">
+        <span>+</span>
+        New chat
+      </button>
+    </header>
+
+    <!-- Chat -->
+    <main class="chat-page">
+      <div id="chat-history" class="chat-history">
+        <!-- Initial empty state -->
+        <section id="welcome" class="welcome">
+          <div class="welcome-icon">D</div>
+          <h1>How can I help?</h1>
+          <p>Ask a question about the indexed documentation.</p>
+        </section>
+      </div>
+    </main>
+
+    <!-- Composer -->
+    <footer class="composer-area">
+      <form id="question-form" class="composer">
+        <textarea
+          id="question"
+          name="question"
+          rows="1"
+          maxlength="2000"
+          placeholder="Ask about the documentation..."
+          autocomplete="off"
+          required
+        ></textarea>
+
+        <div class="composer-bottom">
+          <span class="composer-hint">
+            Enter to send · Shift + Enter for new line
+          </span>
+
+          <button id="send-button" type="submit" aria-label="Send message">
+            <span id="send-icon">↑</span>
+          </button>
+        </div>
+      </form>
+
+      <div class="footer-note">
+        DevDocs can make mistakes. Check important information against the
+        source documentation.
+      </div>
+    </footer>
+  </body>
+</html>

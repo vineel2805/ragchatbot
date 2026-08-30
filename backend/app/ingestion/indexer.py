@@ -478,6 +478,7 @@ def _build_payload(chunk: DocumentChunk, run_id: str, created_at: str) -> dict[s
         "source_id": chunk.source_id,
         "document_id": chunk.document_id,
         "chunk_id": chunk.chunk_id,
+        "chunk_index": chunk.chunk_index,
         "canonical_url": chunk.canonical_url,
         # Content
         "title": chunk.title,

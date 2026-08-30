@@ -231,11 +231,11 @@ class RedirectTests(FetcherTestCase):
             302,
             headers={"location": "/tutorial/first-steps/"},
         )
-        self.site.path_handlers[DOC_PATH] = lambda _r: _html()
+        self.site.path_handlers["/tutorial/first-steps/"] = lambda _r: _html()
         with self._fetcher() as fetcher:
             result = fetcher.fetch("https://fastapi.tiangolo.com/tutorial/")
         self.assertTrue(result.ok)
-        self.assertEqual(result.final_url, "https://fastapi.tiangolo.com/tutorial/first-steps")
+        self.assertEqual(result.final_url, "https://fastapi.tiangolo.com/tutorial/first-steps/")
         self.assertEqual(result.body, HTML_BODY)
 
     def test_redirect_to_disallowed_url(self) -> None:

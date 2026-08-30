@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import unicodedata
 from typing import Callable
 
 from app.retrieval.models import AssembledContext, ChunkContext, RetrievalResult
@@ -9,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 # Sentinel used when no count_tokens function is injected.
 _UNSET = object()
+_MIN_REDUNDANT_CONTENT_CHARS = 256
 
 
 class ContextAssembler:
@@ -73,8 +75,7 @@ class ContextAssembler:
         chunks: list[ChunkContext] = []
         truncated_ids: list[str] = []
         total_tokens = 0
-
-        for hit in result.hits:
+        for hit in _unique_hits(result.hits):
             if len(chunks) >= max_chunks:
                 truncated_ids.append(hit.chunk_id)
                 continue
@@ -130,3 +131,23 @@ class ContextAssembler:
         # Lazy import — only triggers model download when the real tokenizer is used.
         from app.ingestion.tokenize import count_tokens  # lazy
         return count_tokens
+
+
+def _unique_hits(hits):
+    """Keep the first ranked hit for each substantial normalized document chunk."""
+    seen: set[tuple[str, str, str, str]] = set()
+    for hit in hits:
+        normalized = _normalize_chunk_text(hit.text)
+        if len(normalized) < _MIN_REDUNDANT_CONTENT_CHARS:
+            yield hit
+            continue
+        key = (hit.source_id, hit.document_id, hit.canonical_url, normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield hit
+
+
+def _normalize_chunk_text(text: str) -> str:
+    """Normalize only formatting differences, preserving case and code content."""
+    return " ".join(unicodedata.normalize("NFKC", text).split())

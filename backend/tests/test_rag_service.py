@@ -9,9 +9,11 @@ import unittest
 from dataclasses import dataclass, field
 
 from app.generation.models import Citation, GenerationRequest, GenerationResult
+from app.ingestion.embedder import EMBEDDING_DIM
 from app.ingestion.ids import make_chunk_id, make_document_id
+from app.ingestion.indexer import SearchHit
 from app.rag.models import RAGRequest, RAGResponse
-from app.rag.service import RAGService
+from app.rag.service import RAGService, make_rag_service
 from app.retrieval.assembler import ContextAssembler
 from app.retrieval.models import (
     AssembledContext,
@@ -20,6 +22,8 @@ from app.retrieval.models import (
     RetrievalRequest,
     RetrievalResult,
 )
+from app.retrieval.retriever import Retriever
+from unittest.mock import patch, MagicMock
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +454,200 @@ class TruncationTests(unittest.TestCase):
         svc = RAGService(retriever, FakeAssembler(), FakeGenerator(gen_result))
         resp = svc.answer(RAGRequest(query="q"))
         self.assertFalse(resp.context_was_truncated)
+
+
+# ---------------------------------------------------------------------------
+# 9. Factory and configuration wiring tests
+# ---------------------------------------------------------------------------
+
+
+class FactoryWiringTests(unittest.TestCase):
+    """Test make_rag_service() factory with real component construction but mocked I/O."""
+
+    @patch("qdrant_client.QdrantClient")
+    def test_make_rag_service_returns_rag_service_instance(
+        self, mock_qdrant_client
+    ) -> None:
+        """Verify make_rag_service constructs a RAGService without network calls."""
+        # Mock QdrantClient
+        mock_qc_instance = MagicMock()
+        mock_qdrant_client.return_value = mock_qc_instance
+        mock_qc_instance.collection_exists.return_value = True
+        mock_qc_instance.get_collection.return_value = MagicMock(
+            config=MagicMock(params=MagicMock(vectors=MagicMock(size=EMBEDDING_DIM)))
+        )
+
+        # Use a fake embedder instead of mocking SentenceTransformer
+        class FakeEmbedder:
+            def embed(self, texts):
+                return [[1.0 / (EMBEDDING_DIM**0.5)] * EMBEDDING_DIM for _ in texts]
+
+        # Call factory with explicit params
+        svc = make_rag_service(
+            qdrant_url="http://localhost:6333",
+            collection_name="test_collection",
+            openrouter_api_key="sk-test-key",
+            openrouter_model="test-model",
+            embedder=FakeEmbedder(),
+        )
+
+        # Verify instance type
+        self.assertIsInstance(svc, RAGService)
+        self.assertIsNotNone(svc._retriever)
+        self.assertIsNotNone(svc._assembler)
+        self.assertIsNotNone(svc._generator)
+
+    @patch("qdrant_client.QdrantClient")
+    def test_make_rag_service_uses_settings_when_params_none(
+        self, mock_qdrant_client
+    ) -> None:
+        """Verify make_rag_service reads from Settings when params are None."""
+        # Mock QdrantClient
+        mock_qc_instance = MagicMock()
+        mock_qdrant_client.return_value = mock_qc_instance
+        mock_qc_instance.collection_exists.return_value = True
+        mock_qc_instance.get_collection.return_value = MagicMock(
+            config=MagicMock(params=MagicMock(vectors=MagicMock(size=EMBEDDING_DIM)))
+        )
+
+        # Use a fake embedder
+        class FakeEmbedder:
+            def embed(self, texts):
+                return [[1.0 / (EMBEDDING_DIM**0.5)] * EMBEDDING_DIM for _ in texts]
+
+        with patch("app.core.config.Settings") as mock_settings_cls:
+            mock_settings = MagicMock()
+            mock_settings.qdrant_url = "http://settings-qdrant:6333"
+            mock_settings.qdrant_collection = "settings_collection"
+            mock_settings.openrouter_api_key = "sk-settings-key"
+            mock_settings.openrouter_model = "settings-model"
+            mock_settings_cls.return_value = mock_settings
+
+            with patch("app.core.config.get_settings", return_value=mock_settings):
+                # Call factory with no params except embedder (should use settings for rest)
+                svc = make_rag_service(embedder=FakeEmbedder())
+
+                # Verify RAGService was created
+                self.assertIsInstance(svc, RAGService)
+
+                # Verify QdrantClient was called with settings URL
+                mock_qdrant_client.assert_called_with(url="http://settings-qdrant:6333")
+
+    def test_make_rag_service_raises_when_no_api_key(self) -> None:
+        """Verify make_rag_service raises ValueError when no API key is available."""
+        with patch("app.core.config.Settings") as mock_settings_cls:
+            mock_settings = MagicMock()
+            mock_settings.qdrant_url = "http://localhost:6333"
+            mock_settings.qdrant_collection = "test"
+            mock_settings.openrouter_api_key = None  # No key
+            mock_settings.openrouter_model = "test-model"
+            mock_settings_cls.return_value = mock_settings
+
+            with patch("app.core.config.get_settings", return_value=mock_settings):
+                with self.assertRaises(ValueError) as ctx:
+                    make_rag_service()
+                self.assertIn("OPENROUTER_API_KEY", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# 10. End-to-end integration with real classes but fake I/O
+# ---------------------------------------------------------------------------
+
+
+class IntegrationWithFakesTests(unittest.TestCase):
+    """Integration tests using real RAG classes wired with fake I/O components."""
+
+    def test_end_to_end_with_fake_embedder_store_and_client(self) -> None:
+        """Verify Retriever + ContextAssembler + Generator integrate correctly."""
+
+        # --- Fake embedder ---
+        class FakeEmbedder:
+            def embed(self, texts: list[str]) -> list[list[float]]:
+                # Return normalized dummy vectors
+                return [[1.0 / (EMBEDDING_DIM**0.5)] * EMBEDDING_DIM for _ in texts]
+
+        # --- Fake vector store ---
+        class FakeVectorStore:
+            def __init__(self):
+                self.search_calls = []
+
+            def search(self, collection, query_vector, top_k, source_id):
+                self.search_calls.append((collection, top_k, source_id))
+                # Return one fake hit
+                return [
+                    SearchHit(
+                        score=0.95,
+                        point_id="point-1",
+                        payload={
+                            "source_id": "fastapi",
+                            "document_id": make_document_id("fastapi", _FASTAPI_URL),
+                            "chunk_id": make_chunk_id("fastapi", _FASTAPI_URL, 0),
+                            "canonical_url": _FASTAPI_URL,
+                            "title": "First Steps",
+                            "headings": ["Tutorial"],
+                            "breadcrumb": "FastAPI > Tutorial",
+                            "text": "FastAPI is a modern web framework.",
+                            "chunk_index": 0,
+                            "is_active": True,
+                        },
+                    )
+                ]
+
+        # --- Fake LLM client ---
+        class FakeLLMClient:
+            def __init__(self):
+                self.calls = []
+
+            def complete(self, system: str, user: str) -> str:
+                self.calls.append((system, user))
+                return f"FastAPI is great. See {_FASTAPI_URL}"
+
+        # --- Wire up real components with fakes ---
+        fake_embedder = FakeEmbedder()
+        fake_store = FakeVectorStore()
+        fake_llm = FakeLLMClient()
+
+        retriever = Retriever(fake_store, fake_embedder, "test_collection")
+        assembler = ContextAssembler(count_tokens_fn=lambda t: len(t.split()))
+        from app.generation.generator import Generator
+
+        generator = Generator(fake_llm)
+
+        svc = RAGService(retriever, assembler, generator)
+
+        # --- Execute RAG pipeline ---
+        request = RAGRequest(
+            query="How do I use FastAPI?", top_k=5, max_chunks=3, token_budget=500
+        )
+        response = svc.answer(request)
+
+        # --- Assertions ---
+        self.assertTrue(response.ok)
+        self.assertEqual(response.query, "How do I use FastAPI?")
+        self.assertIn("FastAPI is great", response.answer)
+        self.assertEqual(len(response.citations), 1)
+        self.assertEqual(response.citations[0].url, _FASTAPI_URL)
+        self.assertEqual(response.chunks_retrieved, 1)
+        self.assertEqual(response.chunks_in_context, 1)
+
+        # Verify retriever was called
+        self.assertEqual(len(fake_store.search_calls), 1)
+        self.assertEqual(fake_store.search_calls[0][1], 5)  # top_k
+
+        # Verify generator was called
+        self.assertEqual(len(fake_llm.calls), 1)
+
+
+    def test_get_rag_service_dependency(self) -> None:
+        """Verify get_rag_service returns the cached singleton from _build_rag_service."""
+        from app.api.deps import _build_rag_service, get_rag_service
+
+        mock_svc = MagicMock(spec=RAGService)
+        with patch("app.api.deps._build_rag_service", return_value=mock_svc):
+            svc1 = get_rag_service()
+            svc2 = get_rag_service()
+            self.assertIs(svc1, mock_svc)
+            self.assertIs(svc2, mock_svc)
 
 
 if __name__ == "__main__":
