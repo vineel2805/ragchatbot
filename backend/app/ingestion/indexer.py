@@ -419,9 +419,9 @@ class QdrantClientAdapter:
                 FieldCondition(key="source_id", match=MatchValue(value=source_id))
             )
 
-        results = self._client.search(
+        results = self._client.query_points(
             collection_name=collection_name,
-            query_vector=query_vector,
+            query=query_vector,
             query_filter=Filter(must=must),
             limit=top_k,
             with_payload=True,
@@ -433,7 +433,7 @@ class QdrantClientAdapter:
                 point_id=str(r.id),
                 payload=dict(r.payload) if r.payload else {},
             )
-            for r in results
+            for r in results.points
         ]
 
 

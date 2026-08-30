@@ -130,6 +130,8 @@ class DocumentationFetcher:
                 return result
 
             location = exchange.headers.get("location", "")
+            # Resolve redirect location against current URL
+            resolved = urljoin(current, location.strip()) if location else ""
             redirected = validate_redirect(self.source, current, location)
             if not redirected.allowed or redirected.canonical_url is None:
                 failed = FetchResult(
@@ -145,7 +147,8 @@ class DocumentationFetcher:
                 )
                 self._log(failed)
                 return failed
-            current = redirected.canonical_url
+            # Use the resolved URL as-is for the next fetch, not the canonical one
+            current = resolved
 
         failed = FetchResult(
             ok=False,
@@ -242,7 +245,8 @@ class DocumentationFetcher:
                     )
                     self._log(failed)
                     return failed
-                current = redirected.canonical_url
+                # Use the resolved URL as-is for the next fetch, not the canonical one
+                current = resolved
                 continue
             if status in {404, 410}:
                 result = FetchResult(

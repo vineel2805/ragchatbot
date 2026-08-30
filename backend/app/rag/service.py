@@ -156,6 +156,7 @@ def make_rag_service(
     collection_name: str | None = None,
     openrouter_api_key: str | None = None,
     openrouter_model: str | None = None,
+    embedder=None,
     count_tokens_fn=None,
 ) -> RAGService:
     """Wire up a production RAGService with live Qdrant + BgeEmbedder + OpenRouter.
@@ -163,17 +164,24 @@ def make_rag_service(
     All heavy imports (qdrant_client, sentence_transformers, httpx) are
     deferred to the respective factory functions, so this module remains
     importable in test environments.
+
+    Parameters are optional; when ``None``, they are read from
+    :class:`~app.core.config.Settings` (which loads from .env).
     """
+    from app.core.config import get_settings
     from app.generation.generator import make_generator
     from app.retrieval.retriever import make_retriever
 
+    settings = get_settings()
+
     retriever = make_retriever(
-        qdrant_url=qdrant_url,
-        collection_name=collection_name,
+        qdrant_url=qdrant_url or settings.qdrant_url,
+        collection_name=collection_name or settings.qdrant_collection,
+        embedder=embedder,
     )
     assembler = ContextAssembler(count_tokens_fn=count_tokens_fn)
     generator = make_generator(
-        api_key=openrouter_api_key,
-        model=openrouter_model,
+        api_key=openrouter_api_key or settings.openrouter_api_key,
+        model=openrouter_model or settings.openrouter_model,
     )
     return RAGService(retriever, assembler, generator)
